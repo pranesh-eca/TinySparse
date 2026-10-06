@@ -3,7 +3,6 @@
 
 TinySparse sparseEngine;
 
-// A synthetic 64-element array representing an 8x8 image block with ~85% sparsity
 const uint8_t testVector[64] = {
   0, 0, 12, 0, 0, 0, 0, 0,
   0, 25, 0, 0, 0, 8, 0, 0,
@@ -15,49 +14,49 @@ const uint8_t testVector[64] = {
   0, 0, 0, 0, 3, 0, 0, 0
 };
 
+const uint8_t sparseValues[7]  = {12, 25, 8, 42, 15, 5, 3};
+const uint8_t sparseIndices[7] = {2, 9, 13, 27, 38, 49, 60};
+
 void setup() {
   Serial.begin(115200);
-  // Wait for the serial monitor to open before printing
   while (!Serial) { delay(10); } 
   
-  Serial.println("\n--- TinySparse Hardware Benchmark ---");
-  Serial.println("Running 1,000 iterations for precision...");
+  Serial.println("\n--- TinySparse Indexed Architecture Benchmark ---");
 
-  // 1. Benchmark Dense Execution
   uint32_t startDense = micros();
   uint32_t resultDense = 0;
   for (int i = 0; i < 1000; i++) {
-    resultDense = sparseEngine.evaluateDense(testVector, sizeof(testVector));
+    resultDense = sparseEngine.evaluateDense(testVector, 64);
   }
   uint32_t timeDense = micros() - startDense;
 
-  // 2. Benchmark Sparse Execution
   uint32_t startSparse = micros();
   uint32_t resultSparse = 0;
   for (int i = 0; i < 1000; i++) {
-    resultSparse = sparseEngine.evaluateSparse(testVector, sizeof(testVector));
+    resultSparse = sparseEngine.evaluateSparse(testVector, 64);
   }
   uint32_t timeSparse = micros() - startSparse;
 
-  // 3. Print Results to Serial Monitor
-  Serial.println("\n[ Execution Latency ]");
-  Serial.print("Dense Math Time:  ");
-  Serial.print(timeDense);
-  Serial.println(" us");
-  
-  Serial.print("Sparse Math Time: ");
-  Serial.print(timeSparse);
-  Serial.println(" us");
+  uint32_t startIndexed = micros();
+  uint32_t resultIndexed = 0;
+  for (int i = 0; i < 1000; i++) {
+    resultIndexed = sparseEngine.evaluateSparseIndexed(sparseValues, sparseIndices, 7);
+  }
+  uint32_t timeIndexed = micros() - startIndexed;
 
-  Serial.print("\nHardware Speedup: ");
-  Serial.print((float)timeDense / timeSparse);
+  Serial.println("\n[ Execution Latency ]");
+  Serial.print("Dense Math Time:    "); Serial.print(timeDense); Serial.println(" us");
+  Serial.print("Branch Sparse Time: "); Serial.print(timeSparse); Serial.println(" us");
+  Serial.print("Indexed Sparse:     "); Serial.print(timeIndexed); Serial.println(" us");
+
+  Serial.print("\nHardware Speedup (vs Dense): ");
+  Serial.print((float)timeDense / timeIndexed);
   Serial.println("x faster");
 
-  // 4. Verify Mathematical Integrity
-  if (resultDense == resultSparse) {
-    Serial.println("Integrity Check:  PASSED (Outputs perfectly match)");
+  if (resultDense == resultSparse && resultDense == resultIndexed) {
+    Serial.println("Integrity Check:    PASSED");
   } else {
-    Serial.println("Integrity Check:  FAILED (Outputs differ!)");
+    Serial.println("Integrity Check:    FAILED");
   }
 }
 

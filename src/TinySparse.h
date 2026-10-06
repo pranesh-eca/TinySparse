@@ -5,14 +5,10 @@
 
 class TinySparse {
   public:
-    // Constructor to initialize the library
     TinySparse();
-
-    // Standard dense matrix evaluation (The baseline for comparison)
     uint32_t evaluateDense(const uint8_t* inputVector, uint16_t length);
-
-    // Optimized zero-skipping evaluation (Your core thesis algorithm)
     uint32_t evaluateSparse(const uint8_t* inputVector, uint16_t length);
+    uint32_t evaluateSparseIndexed(const uint8_t* values, const uint8_t* indices, uint16_t nonZeroCount);
 };
 
 #endif
