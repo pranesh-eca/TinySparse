@@ -21,7 +21,12 @@ void setup() {
   Serial.begin(115200);
   while (!Serial) { delay(10); } 
   
-  Serial.println("\n--- TinySparse Indexed Architecture Benchmark ---");
+  Serial.println("\n--- TinySparse Hardware Benchmark ---");
+  
+  // Dynamically print the detected compilation target
+  Serial.print("Target Environment: "); 
+  Serial.println(sparseEngine.getEnvironment());
+  Serial.println("-------------------------------------");
 
   uint32_t startDense = micros();
   uint32_t resultDense = 0;
@@ -49,7 +54,7 @@ void setup() {
   Serial.print("Branch Sparse Time: "); Serial.print(timeSparse); Serial.println(" us");
   Serial.print("Indexed Sparse:     "); Serial.print(timeIndexed); Serial.println(" us");
 
-  Serial.print("\nHardware Speedup (vs Dense): ");
+  Serial.print("\nHardware Speedup: ");
   Serial.print((float)timeDense / timeIndexed);
   Serial.println("x faster");
 

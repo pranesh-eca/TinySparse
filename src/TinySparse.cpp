@@ -2,6 +2,10 @@
 
 TinySparse::TinySparse() {}
 
+const char* TinySparse::getEnvironment() {
+  return TARGET_ENV;
+}
+
 uint32_t TinySparse::evaluateDense(const uint8_t* inputVector, uint16_t length) {
   uint32_t accumulator = 0;
   for (uint16_t i = 0; i < length; i++) {
@@ -22,7 +26,6 @@ uint32_t TinySparse::evaluateSparse(const uint8_t* inputVector, uint16_t length)
 
 uint32_t TinySparse::evaluateSparseIndexed(const uint8_t* values, const uint8_t* indices, uint16_t nonZeroCount) {
   uint32_t accumulator = 0;
-  // The CPU executes this loop with zero pipeline stalls.
   for (uint16_t i = 0; i < nonZeroCount; i++) {
     accumulator += values[i] * 2;
   }
