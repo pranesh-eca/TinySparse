@@ -1,0 +1,8 @@
+*.mat
+normal/
+0.007/
+*.exe
+*.o
+*.obj
+build/
+__pycache__/
