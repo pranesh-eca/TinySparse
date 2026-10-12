@@ -1,94 +1,152 @@
 import os
-import scipy.io
 import numpy as np
+import scipy.io as sio
 
-# Adjust BASE_DIR if your folders (0.007, normal) are in another folder.
-# "." means the current folder where this script is executed.
-BASE_DIR = "."
+# Configuration
+WINDOW_SIZE = 128
+STRIDE = 64
+BASE_PATH = "."  # Run from repository root
 
-FILES = {
-    "normal": os.path.join(BASE_DIR, "normal", "Normal_1.mat"),
-    "inner_race": os.path.join(BASE_DIR, "0.007", "IR007_1.mat"),
-    "ball": os.path.join(BASE_DIR, "0.007", "B007_1.mat"),
-    "outer_race": os.path.join(BASE_DIR, "0.007", "OR007@6_1.mat"),
+CLASSES = {
+    0: "Normal",
+    1: "Inner Race Fault",
+    2: "Ball Fault",
+    3: "Outer Race Fault"
 }
 
-WINDOW_SIZE = 128  # 128 consecutive sensor readings per 1D input window
-STEP_SIZE = 64     # 50% overlap between consecutive windows
-
-def extract_drive_end_signal(mat_filepath):
-    """
-    Extracts the Drive End (DE) acceleration array from the MATLAB file.
-    CWRU files store this under keys like 'X098_DE_time' or 'X106_DE_time'.
-    """
-    mat = scipy.io.loadmat(mat_filepath)
-    for key in mat.keys():
+def extract_drive_end_vibration(mat_path):
+    """Extracts Drive-End (DE) accelerometer time series from CWRU .mat file."""
+    data = sio.loadmat(mat_path)
+    for key in data.keys():
         if "DE_time" in key:
-            return mat[key].flatten()
-    raise KeyError(f"No variable containing '_DE_time' found in {mat_filepath}")
+            return data[key].ravel()
+    raise KeyError(f"No DE_time channel found in {mat_path}")
 
-def slice_into_windows(signal_1d, window_size=WINDOW_SIZE, step_size=STEP_SIZE):
-    """
-    Converts a continuous 1D stream of ~120,000 readings into 
-    discrete 128-element windows that mimic an MCU's streaming input buffer.
-    """
-    windows = []
-    total_len = len(signal_1d)
-    for start in range(0, total_len - window_size + 1, step_size):
-        windows.append(signal_1d[start : start + window_size])
-    return np.array(windows, dtype=np.float32)
+def slice_windows(signal, window_size=WINDOW_SIZE, stride=STRIDE):
+    """Slices a 1D signal into windows with a defined stride."""
+    num_windows = (len(signal) - window_size) // stride + 1
+    windows = np.empty((num_windows, window_size), dtype=np.float32)
+    for i in range(num_windows):
+        start = i * stride
+        windows[i] = signal[start : start + window_size]
+    return windows
 
-def main():
-    print("=== Step 1: Ingesting Real CWRU 1D Sensor Data ===")
+def normalize_to_int8(windows):
+    """
+    Min-Max scale each window to [-1.0, 1.0], then symmetrically
+    quantize to INT8 [-127, 127] for embedded MCU input.
+    """
+    normalized = np.empty_like(windows, dtype=np.int8)
+    for i, w in enumerate(windows):
+        max_abs = np.max(np.abs(w))
+        if max_abs > 1e-6:
+            scaled = (w / max_abs) * 127.0
+        else:
+            scaled = np.zeros_like(w)
+        normalized[i] = np.clip(np.round(scaled), -127, 127).astype(np.int8)
+    return normalized
+
+def build_dataset():
+    print("=" * 60)
+    print(" CWRU Zero-Leakage Dataset Generator (Cross-Severity Split)")
+    print("=" * 60)
+
+    # 1. Process Normal Baseline (Single file with temporal partition & guard band)
+    normal_raw = extract_drive_end_vibration(os.path.join(BASE_PATH, "normal", "Normal_1.mat"))
+    N = len(normal_raw)
     
-    X_list = []
-    y_list = []
-    class_names = ["normal", "inner_race", "ball", "outer_race"]
+    # 70% Train, 10% Guard Band (Discarded), 20% Test
+    train_end = int(0.70 * N)
+    test_start = int(0.80 * N)
+    
+    normal_train = normal_raw[:train_end]
+    normal_test = normal_raw[test_start:]
+    
+    # 2. Define File Groups (Hold out 0.014" entirely for testing)
+    train_files = [
+        # (filepath, label, description)
+        (os.path.join(BASE_PATH, "0.007", "IR007_1.mat"), 1, "Inner Race 0.007"),
+        (os.path.join(BASE_PATH, "0.007", "B007_1.mat"),   2, "Ball 0.007"),
+        (os.path.join(BASE_PATH, "0.007", "OR007@6_1.mat"), 3, "Outer Race 0.007"),
+        (os.path.join(BASE_PATH, "0.021", "IR021_1.mat"), 1, "Inner Race 0.021"),
+        (os.path.join(BASE_PATH, "0.021", "B021_1.mat"),   2, "Ball 0.021"),
+        (os.path.join(BASE_PATH, "0.021", "OR021@6_1.mat"), 3, "Outer Race 0.021"),
+    ]
 
-    for class_id, label in enumerate(class_names):
-        path = FILES[label]
-        
-        # Check for .mat extension if Windows saved it without extension
-        if not os.path.exists(path) and os.path.exists(path.replace(".mat", "")):
-            path = path.replace(".mat", "")
+    test_files = [
+        (os.path.join(BASE_PATH, "0.014", "IR014_1.mat"), 1, "Inner Race 0.014"),
+        (os.path.join(BASE_PATH, "0.014", "B014_1.mat"),   2, "Ball 0.014"),
+        (os.path.join(BASE_PATH, "0.014", "OR014@6_1.mat"), 3, "Outer Race 0.014"),
+    ]
 
-        if not os.path.exists(path):
-            print(f"[ERROR] Could not find file at: {path}")
-            print("Please check that the script is in the same folder as 'normal' and '0.007'.")
-            return
+    # 3. Assemble Training Windows
+    X_train_list, y_train_list = [], []
 
-        print(f"Loading {label} from {path}...")
-        raw_signal = extract_drive_end_signal(path)
-        windows = slice_into_windows(raw_signal)
+    # Add Normal train
+    norm_tr_win = normalize_to_int8(slice_windows(normal_train))
+    X_train_list.append(norm_tr_win)
+    y_train_list.append(np.zeros(len(norm_tr_win), dtype=np.int64))
+    print(f"[*] Train: Normal_1 (0-70%) -> {len(norm_tr_win)} windows")
 
-        # Standardize each window (zero mean, unit variance)
-        # Prevents numerical saturation when converted to INT8 later
-        mean = np.mean(windows, axis=1, keepdims=True)
-        std = np.std(windows, axis=1, keepdims=True) + 1e-8
-        windows = (windows - mean) / std
+    # Add Fault train
+    for path, label, desc in train_files:
+        raw_sig = extract_drive_end_vibration(path)
+        win = normalize_to_int8(slice_windows(raw_sig))
+        X_train_list.append(win)
+        y_train_list.append(np.full(len(win), label, dtype=np.int64))
+        print(f"[*] Train: {desc} -> {len(win)} windows")
 
-        labels = np.full(len(windows), class_id, dtype=np.int64)
-        
-        X_list.append(windows)
-        y_list.append(labels)
-        print(f"  -> Generated {len(windows)} windows (shape: {windows.shape})")
+    X_train = np.concatenate(X_train_list, axis=0)
+    y_train = np.concatenate(y_train_list, axis=0)
 
-    X = np.vstack(X_list)
-    y = np.concatenate(y_list)
+    # Shuffle training set
+    np.random.seed(42)
+    train_perm = np.random.permutation(len(X_train))
+    X_train = X_train[train_perm]
+    y_train = y_train[train_perm]
 
-    # Save processed authentic dataset
-    output_path = "cwru_1d_dataset.npz"
-    np.savez_compressed(output_path, X=X, y=y)
+    # Split 15% of the train pool for validation (early stopping / tuning)
+    val_split_idx = int(len(X_train) * 0.85)
+    X_tr, y_tr = X_train[:val_split_idx], y_train[:val_split_idx]
+    X_val, y_val = X_train[val_split_idx:], y_train[val_split_idx:]
 
-    print("\n--- Dataset Ingestion Summary ---")
-    print(f"Output File:       {output_path}")
-    print(f"Total Samples:     {X.shape[0]}")
-    print(f"Feature Dimension: {X.shape[1]} readings per sample")
-    print(f"Class Breakdown:   Class 0 (Normal): {np.sum(y == 0)}")
-    print(f"                   Class 1 (IR):     {np.sum(y == 1)}")
-    print(f"                   Class 2 (Ball):   {np.sum(y == 2)}")
-    print(f"                   Class 3 (OR):     {np.sum(y == 3)}")
-    print("Dataset generation complete. Ready for baseline model training.")
+    # 4. Assemble Held-Out Test Windows (0% overlap, 100% unseen files)
+    X_test_list, y_test_list = [], []
+
+    norm_te_win = normalize_to_int8(slice_windows(normal_test))
+    X_test_list.append(norm_te_win)
+    y_test_list.append(np.zeros(len(norm_te_win), dtype=np.int64))
+    print(f"[!] Test (Held-out): Normal_1 (80-100%) -> {len(norm_te_win)} windows")
+
+    for path, label, desc in test_files:
+        raw_sig = extract_drive_end_vibration(path)
+        win = normalize_to_int8(slice_windows(raw_sig))
+        X_test_list.append(win)
+        y_test_list.append(np.full(len(win), label, dtype=np.int64))
+        print(f"[!] Test (Held-out): {desc} -> {len(win)} windows")
+
+    X_test = np.concatenate(X_test_list, axis=0)
+    y_test = np.concatenate(y_test_list, axis=0)
+
+    # 5. Export Processed Artifact
+    out_dir = os.path.join(BASE_PATH, "models")
+    os.makedirs(out_dir, exist_ok=True)
+    out_file = os.path.join(out_dir, "cwru_1d_dataset.npz")
+
+    np.savez_compressed(
+        out_file,
+        X_train=X_tr, y_train=y_tr,
+        X_val=X_val,   y_val=y_val,
+        X_test=X_test, y_test=y_test
+    )
+
+    print("-" * 60)
+    print(f"Dataset successfully compiled to: {out_file}")
+    print(f"  Training Windows   : {X_tr.shape[0]}")
+    print(f"  Validation Windows : {X_val.shape[0]}")
+    print(f"  Held-Out Test      : {X_test.shape[0]}")
+    print(f"  Window Shape       : {X_tr.shape[1]} samples (INT8)")
+    print("=" * 60)
 
 if __name__ == "__main__":
-    main()
+    build_dataset()

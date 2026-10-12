@@ -1,31 +1,30 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
 
-# -----------------------------------------------------------------------------
-# 1. Self-Check: Verify reproducibility
-# -----------------------------------------------------------------------------
-torch.manual_seed(42)
-np.random.seed(42)
+# Hyperparameters & Config
+WINDOW_SIZE = 128
+NUM_CLASSES = 4
+BATCH_SIZE = 64
+EPOCHS = 40
+LEARNING_RATE = 1e-3
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# -----------------------------------------------------------------------------
-# 2. Define the MCU-Friendly 1D Neural Network
-# -----------------------------------------------------------------------------
-class TinySensorNet(nn.Module):
+CLASS_NAMES = ["Normal", "Inner Race", "Ball", "Outer Race"]
+
+# Fixed 3-Layer MLP Architecture matching TinySparse C++ core
+class TinySparseMLP(nn.Module):
     def __init__(self):
-        super(TinySensorNet, self).__init__()
-        # Layer 1: 128 input sensor points -> 32 features
-        self.fc1 = nn.Linear(128, 32)
+        super(TinySparseMLP, self).__init__()
+        self.fc1 = nn.Linear(WINDOW_SIZE, 32, bias=True)
         self.relu1 = nn.ReLU()
-        
-        # Layer 2: 32 features -> 16 features
-        self.fc2 = nn.Linear(32, 16)
+        self.fc2 = nn.Linear(32, 16, bias=True)
         self.relu2 = nn.ReLU()
-        
-        # Layer 3: 16 features -> 4 class logits
-        self.fc3 = nn.Linear(16, 4)
+        self.fc3 = nn.Linear(16, NUM_CLASSES, bias=True)
 
     def forward(self, x):
         x = self.relu1(self.fc1(x))
@@ -34,81 +33,122 @@ class TinySensorNet(nn.Module):
         return x
 
 def main():
-    print("=== Step 2: Training Dense Baseline Model ===")
-    
-    # Load the authentic CWRU dataset created in Step 1
-    data = np.load("cwru_1d_dataset.npz")
-    X = data["X"]  # Shape: (13271, 128)
-    y = data["y"]  # Shape: (13271,)
+    print("=" * 65)
+    print(" Phase 1.2: Training Baseline MLP on Zero-Leakage Dataset")
+    print(f" Device: {DEVICE}")
+    print("=" * 65)
 
-    # Split into 80% Training and 20% Testing sets
-    # stratify=y ensures balanced class distribution in both splits
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
+    data_path = os.path.join("models", "cwru_1d_dataset.npz")
+    if not os.path.exists(data_path):
+        raise FileNotFoundError(f"Missing {data_path}. Run prepare_cwru_dataset.py first.")
+
+    data = np.load(data_path)
+    X_train, y_train = data["X_train"].astype(np.float32), data["y_train"]
+    X_val, y_val = data["X_val"].astype(np.float32), data["y_val"]
+    X_test, y_test = data["X_test"].astype(np.float32), data["y_test"]
+
+    print(f"Train samples : {len(X_train)}")
+    print(f"Val samples   : {len(X_val)}")
+    print(f"Test samples  : {len(X_test)} (Held-out, untouched during training)")
+
+    train_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train)),
+        batch_size=BATCH_SIZE, shuffle=True
+    )
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_val), torch.from_numpy(y_val)),
+        batch_size=BATCH_SIZE, shuffle=False
+    )
+    test_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_test), torch.from_numpy(y_test)),
+        batch_size=BATCH_SIZE, shuffle=False
     )
 
-    # Convert to PyTorch tensors
-    train_dataset = TensorDataset(torch.tensor(X_train, dtype=torch.float32), 
-                                  torch.tensor(y_train, dtype=torch.long))
-    test_dataset = TensorDataset(torch.tensor(X_test, dtype=torch.float32), 
-                                 torch.tensor(y_test, dtype=torch.long))
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
-
-    # Instantiate model, loss function, and Adam optimizer
-    model = TinySensorNet()
+    model = TinySparseMLP().to(DEVICE)
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 
-    # Train for 15 epochs
-    epochs = 15
-    for epoch in range(1, epochs + 1):
+    best_val_acc = 0.0
+    best_weights_path = os.path.join("models", "dense_baseline_model.pth")
+
+    print("\nStarting Training Loop...")
+    for epoch in range(1, EPOCHS + 1):
         model.train()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        running_loss, correct, total = 0.0, 0, 0
 
-        for inputs, labels in train_loader:
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
-            total_loss += loss.item() * inputs.size(0)
+            running_loss += loss.item() * inputs.size(0)
             _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
 
-        epoch_loss = total_loss / total
-        epoch_acc = (correct / total) * 100.0
+        train_acc = 100.0 * correct / total
+        train_loss = running_loss / total
 
-        if epoch % 5 == 0 or epoch == 1:
-            print(f"Epoch [{epoch:02d}/{epochs:02d}] - Loss: {epoch_loss:.4f} | Train Acc: {epoch_acc:.2f}%")
+        # Validation phase (No test set usage)
+        model.eval()
+        val_correct, val_total, val_loss = 0, 0, 0.0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                inputs, targets = inputs.to(DEVICE), targets.to(DEVICE)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
+                _, predicted = outputs.max(1)
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
 
-    # -------------------------------------------------------------------------
-    # 3. Evaluate Dense Baseline Accuracy on Unseen Test Data
-    # -------------------------------------------------------------------------
+        val_acc = 100.0 * val_correct / val_total
+        val_loss = val_loss / val_total
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), best_weights_path)
+            saved_tag = "[Saved Best Model]"
+        else:
+            saved_tag = ""
+
+        if epoch % 5 == 0 or epoch == 1 or saved_tag != "":
+            print(f"Epoch [{epoch:02d}/{EPOCHS:02d}] "
+                  f"Train Loss: {train_loss:.4f} | Train Acc: {train_acc:6.2f}% | "
+                  f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:6.2f}% {saved_tag}")
+
+    print("\n" + "=" * 65)
+    print(" Final Evaluation on Held-Out Test Set (0.014\" Defect Data)")
+    print("=" * 65)
+
+    # Load best checkpoint
+    model.load_state_dict(torch.load(best_weights_path))
     model.eval()
-    test_correct = 0
-    test_total = 0
 
+    y_true, y_pred = [], []
     with torch.no_grad():
-        for inputs, labels in test_loader:
+        for inputs, targets in test_loader:
+            inputs = inputs.to(DEVICE)
             outputs = model(inputs)
             _, predicted = outputs.max(1)
-            test_total += labels.size(0)
-            test_correct += predicted.eq(labels).sum().item()
+            y_true.extend(targets.numpy())
+            y_pred.extend(predicted.cpu().numpy())
 
-    baseline_accuracy = (test_correct / test_total) * 100.0
-    print("\n-------------------------------------------")
-    print(f"Dense Baseline Test Accuracy: {baseline_accuracy:.2f}%")
-    print("-------------------------------------------")
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    test_acc = 100.0 * np.mean(y_true == y_pred)
 
-    # Save trained baseline model weights
-    torch.save(model.state_dict(), "dense_baseline_model.pth")
-    print("Baseline weights saved to: dense_baseline_model.pth")
+    print(f"\nFinal Test Accuracy: {test_acc:.2f}%\n")
+    print("Classification Report:")
+    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=4))
+
+    print("Confusion Matrix:")
+    cm = confusion_matrix(y_true, y_pred)
+    print(cm)
+    print("=" * 65)
 
 if __name__ == "__main__":
     main()
