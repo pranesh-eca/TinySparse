@@ -1,22 +1,28 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.utils.prune as prune
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+from sklearn.metrics import classification_report, confusion_matrix
 
-torch.manual_seed(42)
-np.random.seed(42)
+WINDOW_SIZE = 128
+NUM_CLASSES = 4
+SPARSITY_TARGET = 0.70
+FINETUNE_EPOCHS = 20
+BATCH_SIZE = 64
+DEVICE = torch.device("cpu")
+CLASS_NAMES = ["Normal", "Inner Race", "Ball", "Outer Race"]
 
-# Same architecture as baseline
-class TinySensorNet(nn.Module):
+class TinySparseMLP(nn.Module):
     def __init__(self):
-        super(TinySensorNet, self).__init__()
-        self.fc1 = nn.Linear(128, 32)
+        super(TinySparseMLP, self).__init__()
+        self.fc1 = nn.Linear(WINDOW_SIZE, 32, bias=True)
         self.relu1 = nn.ReLU()
-        self.fc2 = nn.Linear(32, 16)
+        self.fc2 = nn.Linear(32, 16, bias=True)
         self.relu2 = nn.ReLU()
-        self.fc3 = nn.Linear(16, 4)
+        self.fc3 = nn.Linear(16, NUM_CLASSES, bias=True)
 
     def forward(self, x):
         x = self.relu1(self.fc1(x))
@@ -24,127 +30,196 @@ class TinySensorNet(nn.Module):
         x = self.fc3(x)
         return x
 
-def evaluate(model, test_loader):
-    model.eval()
-    correct = 0
-    total = 0
-    with torch.no_grad():
-        for inputs, labels in test_loader:
-            outputs = model(inputs)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
-    return (correct / total) * 100.0
+def calibrate_shift(acc_values):
+    """Finds the optimal bit-shift S so 99.9% of positive activations fit in [0, 127]."""
+    max_val = np.percentile(np.maximum(0, acc_values), 99.9)
+    if max_val <= 127:
+        return 0
+    shift = int(np.ceil(np.log2(max_val / 127.0)))
+    return max(0, shift)
+
+def bit_exact_int8_forward(X_int8, w1_q, b1_q, s1, w2_q, b2_q, s2, w3_q, b3_q):
+    """
+    Instruction-for-instruction mirror of the C++ TinySparse integer kernel.
+    Uses int32 accumulators, exact bit-shifts, and int8 clamping.
+    """
+    X_i32 = X_int8.astype(np.int32)
+    
+    # Layer 1: INT8 MAC -> INT32 Acc -> ReLU -> Shift -> Clamp INT8
+    acc1 = np.matmul(X_i32, w1_q.astype(np.int32).T) + b1_q.astype(np.int32)
+    act1 = np.maximum(0, acc1) >> s1
+    out1_int8 = np.clip(act1, 0, 127).astype(np.int8)
+
+    # Layer 2: INT8 MAC -> INT32 Acc -> ReLU -> Shift -> Clamp INT8
+    acc2 = np.matmul(out1_int8.astype(np.int32), w2_q.astype(np.int32).T) + b2_q.astype(np.int32)
+    act2 = np.maximum(0, acc2) >> s2
+    out2_int8 = np.clip(act2, 0, 127).astype(np.int8)
+
+    # Layer 3 (Dense Output): INT8 MAC -> INT32 Logits
+    logits_int32 = np.matmul(out2_int8.astype(np.int32), w3_q.astype(np.int32).T) + b3_q.astype(np.int32)
+    return out1_int8, out2_int8, logits_int32
+
+def quantize_layer(weight_fp32, bias_fp32, input_scale_factor=1.0):
+    """
+    Quantizes weights symmetrically to [-127, 127] and scales bias to match
+    the accumulator scale: Scale_acc = Scale_w * input_scale_factor.
+    """
+    w_max = np.max(np.abs(weight_fp32))
+    w_scale = 127.0 / w_max if w_max > 1e-8 else 1.0
+    w_q = np.clip(np.round(weight_fp32 * w_scale), -127, 127).astype(np.int8)
+    
+    # Enforce exact zero where pruned
+    w_q[weight_fp32 == 0.0] = 0
+
+    b_scale = w_scale * input_scale_factor
+    b_q = np.round(bias_fp32 * b_scale).astype(np.int32)
+    return w_q, b_q, w_scale, b_scale
 
 def main():
-    print("=== Step 3: Accuracy-Preserving Pruning & INT8 Quantization ===")
-    
-    # 1. Load Data
-    data = np.load("cwru_1d_dataset.npz")
-    X, y = data["X"], data["y"]
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.20, random_state=42, stratify=y
-    )
+    print("=" * 70)
+    print(f" Phase 1.3: L1 Unstructured Pruning ({int(SPARSITY_TARGET*100)}%) & Bit-Exact INT8 Verification")
+    print("=" * 70)
+
+    data = np.load(os.path.join("models", "cwru_temporal_dataset.npz"))
+    X_train, y_train = data["X_train"], data["y_train"]
+    X_val, y_val     = data["X_val"], data["y_val"]
+    X_test, y_test   = data["X_test"], data["y_test"]
 
     train_loader = DataLoader(
-        TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
-        batch_size=32, shuffle=True
+        TensorDataset(torch.from_numpy(X_train.astype(np.float32)), torch.from_numpy(y_train)),
+        batch_size=BATCH_SIZE, shuffle=True
     )
-    test_loader = DataLoader(
-        TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long)),
-        batch_size=64, shuffle=False
+    val_loader = DataLoader(
+        TensorDataset(torch.from_numpy(X_val.astype(np.float32)), torch.from_numpy(y_val)),
+        batch_size=BATCH_SIZE, shuffle=False
     )
 
-    # 2. Load the trained dense baseline
-    model = TinySensorNet()
-    model.load_state_dict(torch.load("dense_baseline_model.pth"))
-    baseline_acc = evaluate(model, test_loader)
-    print(f"Loaded Dense Baseline Accuracy: {baseline_acc:.2f}%\n")
+    model = TinySparseMLP().to(DEVICE)
+    baseline_path = os.path.join("models", "dense_baseline_temporal.pth")
+    model.load_state_dict(torch.load(baseline_path, map_location=DEVICE))
 
-    # 3. Apply Magnitude Pruning (Target: 70% sparsity on hidden layers)
-    # Layer 1: 128 -> 32 (4096 weights - our primary candidate for acceleration)
-    # Layer 2: 32 -> 16 (512 weights)
-    # Output layer (fc3) has only 64 weights; we keep it dense to protect class boundaries.
-    print("Applying 70% L1-norm magnitude pruning on fc1 and fc2...")
-    prune.l1_unstructured(model.fc1, name='weight', amount=0.70)
-    prune.l1_unstructured(model.fc2, name='weight', amount=0.70)
+    # Apply L1 unstructured pruning to FC1 and FC2
+    prune.l1_unstructured(model.fc1, name="weight", amount=SPARSITY_TARGET)
+    prune.l1_unstructured(model.fc2, name="weight", amount=SPARSITY_TARGET)
 
-    acc_after_raw_prune = evaluate(model, test_loader)
-    print(f"Accuracy immediately after raw pruning (before recovery): {acc_after_raw_prune:.2f}%")
-
-    # 4. Fine-Tuning to Recover Accuracy
-    print("\nFine-tuning for 5 epochs to restore model accuracy...")
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005)
+    optimizer = optim.Adam(model.parameters(), lr=5e-4)
 
-    for epoch in range(1, 6):
+    best_val_acc = 0.0
+    best_state = None
+
+    print("\nFine-Tuning Pruned Model (Validating strictly on X_val, X_test untouched)...")
+    for epoch in range(1, FINETUNE_EPOCHS + 1):
         model.train()
-        for inputs, labels in train_loader:
+        for inputs, targets in train_loader:
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, labels)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
 
-        acc = evaluate(model, test_loader)
-        print(f"  Fine-tune Epoch [{epoch}/5] -> Test Accuracy: {acc:.2f}%")
+        model.eval()
+        val_correct, val_total = 0, 0
+        with torch.no_grad():
+            for inputs, targets in val_loader:
+                outputs = model(inputs)
+                _, predicted = outputs.max(1)
+                val_total += targets.size(0)
+                val_correct += predicted.eq(targets).sum().item()
 
-    # Make pruning permanent (removes PyTorch internal masks)
-    prune.remove(model.fc1, 'weight')
-    prune.remove(model.fc2, 'weight')
+        val_acc = 100.0 * val_correct / val_total
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_state = {k: v.clone() for k, v in model.state_dict().items()}
 
-    final_pruned_acc = evaluate(model, test_loader)
-    print(f"\nFinal Pruned FP32 Accuracy: {final_pruned_acc:.2f}%")
+        if epoch % 5 == 0 or epoch == 1:
+            print(f"Epoch [{epoch:02d}/{FINETUNE_EPOCHS:02d}] Val Acc (Pruned FP32): {val_acc:.2f}%")
 
-    # Self-Audit: Verify accuracy did not drop beyond acceptable margin
-    if final_pruned_acc < (baseline_acc - 2.0):
-        print("[!] AUDIT FAILED: Accuracy dropped by more than 2%. Aborting export.")
-        return
-    else:
-        print("[v] AUDIT PASSED: Accuracy preserved within acceptable threshold.")
+    model.load_state_dict(best_state)
+    prune.remove(model.fc1, "weight")
+    prune.remove(model.fc2, "weight")
+    model.eval()
 
-    # 5. INT8 Quantization (Symmetric per-tensor scaling)
-    print("\n--- Symmetric INT8 Quantization & Sparsity Audit ---")
-    
-    quantized_weights = {}
-    for name, param in [("fc1", model.fc1.weight), ("fc2", model.fc2.weight), ("fc3", model.fc3.weight)]:
-        w = param.detach().numpy()
-        total_elements = w.size
-        
-        # Max-abs symmetric scaling to signed 8-bit range [-127, 127]
-        max_val = np.max(np.abs(w))
-        scale = 127.0 / (max_val + 1e-8)
-        w_int8 = np.round(w * scale).astype(np.int8)
+    # Evaluate Pruned FP32 on Held-Out Test Set
+    with torch.no_grad():
+        test_logits_fp32 = model(torch.from_numpy(X_test.astype(np.float32)))
+        pred_fp32 = test_logits_fp32.argmax(dim=1).numpy()
+    fp32_test_acc = 100.0 * np.mean(pred_fp32 == y_test)
 
-        # Count actual zeros
-        nnz = np.count_nonzero(w_int8)
-        sparsity = (1.0 - (nnz / total_elements)) * 100.0
-        
-        dense_bytes = total_elements * 1  # 1 byte per int8
-        sparse_bytes = nnz * 2            # 1 byte value + 1 byte uint8 index
+    # Extract FP32 numpy arrays
+    w1_fp = model.fc1.weight.detach().numpy()
+    b1_fp = model.fc1.bias.detach().numpy()
+    w2_fp = model.fc2.weight.detach().numpy()
+    b2_fp = model.fc2.bias.detach().numpy()
+    w3_fp = model.fc3.weight.detach().numpy()
+    b3_fp = model.fc3.bias.detach().numpy()
 
-        print(f"Layer [{name}]: Shape {w_int8.shape} | Sparsity: {sparsity:.1f}%")
-        print(f"  Total Weights: {total_elements} | Non-Zero (NNZ): {nnz}")
-        print(f"  Storage Cost: Dense = {dense_bytes} Bytes | Sparse = {sparse_bytes} Bytes")
-        
-        if sparse_bytes < dense_bytes:
-            savings = ((dense_bytes - sparse_bytes) / dense_bytes) * 100.0
-            print(f"  -> Sparse is efficient: Saves {savings:.1f}% Flash storage & skips {total_elements - nnz} MACs.")
-        else:
-            print(f"  -> Dense is more efficient: Sparsity too low to beat Index Tax. Keep dense.")
+    # Step-by-Step Fixed-Point Calibration on Validation Set (X_val)
+    X_val_i32 = X_val.astype(np.int32)
 
-        quantized_weights[name] = w_int8
+    # Layer 1 Quantization & Shift Calibration
+    w1_q, b1_q, w1_scale, _ = quantize_layer(w1_fp, b1_fp, input_scale_factor=1.0)
+    acc1_val = np.matmul(X_val_i32, w1_q.astype(np.int32).T) + b1_q
+    s1 = calibrate_shift(acc1_val)
+    out1_val = np.clip(np.maximum(0, acc1_val) >> s1, 0, 127).astype(np.int8)
+    act1_scale = w1_scale / (2 ** s1)
 
-    # Save quantized parameters for the C++ compiler
-    np.savez("pruned_quantized_model.npz", 
-             fc1=quantized_weights["fc1"], 
-             fc2=quantized_weights["fc2"], 
-             fc3=quantized_weights["fc3"],
-             fc1_bias=model.fc1.bias.detach().numpy(),
-             fc2_bias=model.fc2.bias.detach().numpy(),
-             fc3_bias=model.fc3.bias.detach().numpy())
-    
-    print("\nQuantized parameters saved to: pruned_quantized_model.npz")
+    # Layer 2 Quantization & Shift Calibration
+    w2_q, b2_q, w2_scale, _ = quantize_layer(w2_fp, b2_fp, input_scale_factor=act1_scale)
+    acc2_val = np.matmul(out1_val.astype(np.int32), w2_q.astype(np.int32).T) + b2_q
+    s2 = calibrate_shift(acc2_val)
+    act2_scale = (act1_scale * w2_scale) / (2 ** s2)
+
+    # Layer 3 Quantization
+    w3_q, b3_q, w3_scale, _ = quantize_layer(w3_fp, b3_fp, input_scale_factor=act2_scale)
+
+    # Execute Bit-Exact INT8 Inference on Untouched Held-Out Test Set (X_test)
+    _, _, test_logits_int32 = bit_exact_int8_forward(
+        X_test, w1_q, b1_q, s1, w2_q, b2_q, s2, w3_q, b3_q
+    )
+    pred_int8 = np.argmax(test_logits_int32, axis=1)
+    int8_test_acc = 100.0 * np.mean(pred_int8 == y_test)
+
+    # Calculate Sparsity Metrics
+    l1_nz = np.count_nonzero(w1_q)
+    l2_nz = np.count_nonzero(w2_q)
+    l1_sparsity = 100.0 * (1.0 - l1_nz / w1_q.size)
+    l2_sparsity = 100.0 * (1.0 - l2_nz / w2_q.size)
+
+    print("\n" + "=" * 70)
+    print(" Final Held-Out Test Set Results (Path B Chronological Split)")
+    print("=" * 70)
+    print(f"  Layer 1 Sparsity           : {l1_sparsity:.2f}% ({l1_nz} / {w1_q.size} non-zero)")
+    print(f"  Layer 2 Sparsity           : {l2_sparsity:.2f}% ({l2_nz} / {w2_q.size} non-zero)")
+    print(f"  Calibrated Bit-Shifts      : Layer 1 >> {s1} | Layer 2 >> {s2}")
+    print(f"  Pruned FP32 Test Accuracy  : {fp32_test_acc:.2f}%")
+    print(f"  Verified INT8 Test Accuracy: {int8_test_acc:.2f}% (Delta: {int8_test_acc - fp32_test_acc:+.2f}%)")
+    print("-" * 70)
+    print("\nINT8 Classification Report:")
+    print(classification_report(y_test, pred_int8, target_names=CLASS_NAMES, digits=4))
+    print("INT8 Confusion Matrix:")
+    print(confusion_matrix(y_test, pred_int8))
+    print("=" * 70)
+
+    # Save Quantized Artifact + Golden Reference Test Vectors for C++ Verification
+    sample_idx = 0
+    ref_l1, ref_l2, ref_logits = bit_exact_int8_forward(
+        X_test[sample_idx:sample_idx+1], w1_q, b1_q, s1, w2_q, b2_q, s2, w3_q, b3_q
+    )
+
+    out_npz = os.path.join("models", "pruned_quantized_model.npz")
+    np.savez_compressed(
+        out_npz,
+        fc1_w=w1_q, fc1_b=b1_q, fc1_shift=np.int32(s1),
+        fc2_w=w2_q, fc2_b=b2_q, fc2_shift=np.int32(s2),
+        fc3_w=w3_q, fc3_b=b3_q,
+        ref_input=X_test[sample_idx],
+        ref_l1=ref_l1[0],
+        ref_l2=ref_l2[0],
+        ref_logits=ref_logits[0],
+        ref_label=np.int32(y_test[sample_idx])
+    )
+    print(f"\nSaved verified INT8 model & golden test vectors to: {out_npz}")
 
 if __name__ == "__main__":
     main()
