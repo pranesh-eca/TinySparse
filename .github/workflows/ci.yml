@@ -1,0 +1,28 @@
+name: TinySparse CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up GCC compiler
+      run: sudo apt-get update && sudo apt-get install -y g++
+
+    - name: Run RingBuffer1D Unit Tests
+      run: |
+        g++ -O3 -Wall -Wextra -Iinclude tests/test_ring_buffer.cpp -o test_ring_buffer
+        ./test_ring_buffer
+
+    - name: Run Host C++ Bit-Exact Verification Suite
+      run: |
+        g++ -O3 -Wall -Wextra -Iinclude examples/pc_verify/verify_inference.cpp -o verify_inference
+        ./verify_inference
