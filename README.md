@@ -29,18 +29,23 @@ To maintain strict embedded resource transparency, memory is reported across dis
 
 ---
 
-## Empirical Hardware Profiling (ESP32-S3 @ 240 MHz)
+## Empirical Hardware Profiling & Sparsity Crossover Sweep
 
-Execution cycles measured directly on silicon using internal processor cycle counters (`rsr %0, ccount`) over native USB CDC:
+Measurements captured on physical silicon (**ESP32-S3, Xtensa Dual-Core 32-bit LX7 @ 240 MHz**) using internal hardware cycle counters (`rsr %0, ccount`) over native USB CDC, averaged across 1,000 inference runs:
 
-| Execution Stage | Architecture | Compute Workload | CPU Cycles | Latency (@ 240 MHz) |
-| :--- | :--- | :--- | :--- | :--- |
-| **Layer 1 (128 -> 32)** | **Sparse COO (70% Sparsity)** | **1,229 MACs** | **15,591** | **64.96 µs** |
-| *Layer 1 Baseline* | *Dense Kernel (0% Sparsity)* | *4,096 MACs* | *31,091* | *129.55 µs* |
-| **Layer 2 (32 -> 16)** | Sparse COO (70% Sparsity) | 154 MACs | 2,987 | 12.45 µs |
-| **Layer 3 (16 -> 4)** | Dense Kernel (Output Logits) | 64 MACs | 932 | 3.88 µs |
-| **Total Engine Latency** | **Hybrid TinySparse Pipeline** | **1,447 MACs** | **21,545** | **89.77 µs** |
+| Model Configuration | Layer 1 | Layer 2 | Layer 3 | End-to-End Cycles | End-to-End Latency | System Speedup | Total Model Flash | INT8 Test Accuracy |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0% (Dense Kernel)** | 74,892 cyc | 9,708 cyc | 1,120 cyc | 85,722 cyc | 357.17 µs | 1.00x (Baseline) | 4,880 Bytes | 91.78% |
+| **0% (COO Kernel)** | 78,409 cyc | 10,102 cyc | 1,116 cyc | 89,628 cyc | 373.45 µs | 0.96x (-4.5%) | 4,880 Bytes | 91.78% |
+| **50% (COO Sparse)** | 39,943 cyc | 5,313 cyc | 1,117 cyc | 46,375 cyc | 193.23 µs | 1.85x | 4,980 Bytes | 91.37% |
+| **70% (COO Sparse)** | **24,269 cyc** | **3,361 cyc** | **1,116 cyc** | **28,748 cyc** | **119.78 µs** | **2.98x** | **3,136 Bytes** | **88.73%** |
+| **80% (COO Sparse)** | 16,439 cyc | 2,351 cyc | 1,115 cyc | 19,906 cyc | 82.94 µs | 4.31x | 2,210 Bytes | 83.27% |
+| **90% (COO Sparse)** | 8,588 cyc | 1,391 cyc | 1,116 cyc | 11,096 cyc | 46.23 µs | 7.73x | 1,288 Bytes | 64.07% |
 
+### Engineering Takeaways
+1. **The Indirection Tax:** At 0% pruning, COO execution is ~4.5% slower than dense due to column index loads and row offset indirection[cite: 1].
+2. **Flash Memory Threshold:** Because COO requires 2 bytes per weight plus row offset tables, storage savings only begin above ~52% sparsity[cite: 1]. At 50%, COO is 100 bytes larger than dense.
+3. **The Pareto Optimal Point:** 70% sparsity achieves a **2.98x full-pipeline speedup** and **35.7% Flash reduction** while preserving 88.73% 4-class test accuracy on temporal holdout data.
 ### Silicon Efficiency Takeaways
 * **Layer 1 Speedup:** **1.99x faster (49.9% cycle reduction)** and **40.0% Flash memory savings** on Layer 1 parameters.
 * **Sparsity Indirection Overhead:** Dense sequential streaming averages ~7.6 cycles/MAC on Xtensa LX7, whereas sparse indirect indexing averages ~12.7 cycles/MAC. A minimum of 60–70% sparsity is required to overcome the pointer-lookup overhead on this core.
