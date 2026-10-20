@@ -28,19 +28,18 @@ To maintain strict embedded resource transparency, memory is reported across dis
 | **Flash Parameter Storage (Dense L1 Base)** | 4,096 Bytes | 4,096 dense weights (INT8) |
 
 ---
-
 ## Empirical Hardware Profiling & Sparsity Crossover Sweep
 
-Measurements captured on physical silicon (**ESP32-S3, Xtensa Dual-Core 32-bit LX7 @ 240 MHz**) using internal hardware cycle counters (`rsr %0, ccount`) over native USB CDC, averaged across 1,000 inference runs:
+Measurements captured on physical silicon (**ESP32-S3, Xtensa Dual-Core 32-bit LX7 @ 240 MHz**) using internal hardware cycle counters (`rsr %0, ccount`) over native USB CDC, averaged across 1,000 inference runs, paired with bit-exact INT8 accuracy on the strict 60/15/15 chronological holdout split:
 
-| Model Configuration | Layer 1 | Layer 2 | Layer 3 | End-to-End Cycles | End-to-End Latency | System Speedup | Total Model Flash | INT8 Test Accuracy |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **0% (Dense Kernel)** | 74,892 cyc | 9,708 cyc | 1,120 cyc | 85,722 cyc | 357.17 µs | 1.00x (Baseline) | 4,880 Bytes | 91.78% |
-| **0% (COO Kernel)** | 78,409 cyc | 10,102 cyc | 1,116 cyc | 89,628 cyc | 373.45 µs | 0.96x (-4.5%) | 4,880 Bytes | 91.78% |
-| **50% (COO Sparse)** | 39,943 cyc | 5,313 cyc | 1,117 cyc | 46,375 cyc | 193.23 µs | 1.85x | 4,980 Bytes | 91.37% |
-| **70% (COO Sparse)** | **24,269 cyc** | **3,361 cyc** | **1,116 cyc** | **28,748 cyc** | **119.78 µs** | **2.98x** | **3,136 Bytes** | **88.73%** |
-| **80% (COO Sparse)** | 16,439 cyc | 2,351 cyc | 1,115 cyc | 19,906 cyc | 82.94 µs | 4.31x | 2,210 Bytes | 83.27% |
-| **90% (COO Sparse)** | 8,588 cyc | 1,391 cyc | 1,116 cyc | 11,096 cyc | 46.23 µs | 7.73x | 1,288 Bytes | 64.07% |
+| Model Configuration | L1 Non-Zero MACs | L2 Non-Zero MACs | Total MACs | End-to-End Cycles | Latency (@ 240 MHz) | System Speedup | Total Model Flash | FP32 Test Acc | Verified INT8 Acc |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **0% (Dense Kernel)** | 4,054 | 503 | 4,621 | 85,722 cyc | 357.17 µs | 1.00x (Base) | 4,880 Bytes | 91.36% | 91.00% |
+| **0% (COO Kernel)** | 4,054 | 503 | 4,621 | 89,628 cyc | 373.45 µs | 0.96x (-4.5%) | 4,880 Bytes | 91.36% | 91.00% |
+| **50% (COO Sparse)** | 2,048 | 256 | 2,368 | 46,375 cyc | 193.23 µs | 1.85x | 4,980 Bytes | 90.46% | 90.62% |
+| **70% (COO Sparse)** | **1,226** | **154** | **1,444** | **28,748 cyc** | **119.78 µs** | **2.98x** | **3,132 Bytes** | **88.92%** | **88.75%** |
+| **80% (COO Sparse)** | 817 | 102 | 983 | 19,906 cyc | 82.94 µs | 4.31x | 2,210 Bytes | 84.01% | 84.09% |
+| **90% (COO Sparse)** | 406 | 51 | 521 | 11,096 cyc | 46.23 µs | 7.73x | 1,286 Bytes | 70.14% | 69.92% |
 
 ### Engineering Takeaways
 1. **The Indirection Tax:** At 0% pruning, COO execution is ~4.5% slower than dense due to column index loads and row offset indirection[cite: 1].
