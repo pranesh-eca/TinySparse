@@ -31,3 +31,8 @@ add_test(NAME test_ring_buffer COMMAND test_ring_buffer)
 add_executable(verify_inference examples/pc_verify/verify_inference.cpp)
 target_link_libraries(verify_inference PRIVATE TinySparse)
 add_test(NAME verify_inference COMMAND verify_inference)
+
+# 3. Kernel Edge-Case Tests
+add_executable(test_kernels tests/test_kernels.cpp)
+target_link_libraries(test_kernels PRIVATE TinySparse)
+add_test(NAME test_kernels COMMAND test_kernels)

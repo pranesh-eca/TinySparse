@@ -31,18 +31,18 @@ struct SweepResult {
     uint8_t  pred_class;
 };
 
-// Macro to profile any Sparse COO model configuration over NUM_RUNS iterations
-#define PROFILE_SPARSE_MODEL(PREFIX, SP_PCT, RESULT_STRUCT) \
+// Macro accepts both lowercase array prefix and uppercase constant prefix
+#define PROFILE_SPARSE_MODEL(P_LOW, P_UP, SP_PCT, RESULT_STRUCT) \
     do { \
         uint32_t sum_l1 = 0, sum_l2 = 0, sum_l3 = 0, sum_tot = 0; \
         uint8_t pred = 0; \
         for (int r = 0; r < NUM_RUNS; ++r) { \
             uint32_t t0 = get_ccount(); \
-            TinySparse::sparse_fc_relu(input_buf, PREFIX##_fc1_val, PREFIX##_fc1_idx, PREFIX##_fc1_off, PREFIX##_fc1_b, l1_out, FC1_OUT, PREFIX##_S1); \
+            TinySparse::sparse_fc_relu(input_buf, P_LOW##_fc1_val, P_LOW##_fc1_idx, P_LOW##_fc1_off, P_LOW##_fc1_b, l1_out, FC1_OUT, P_UP##_S1); \
             uint32_t t1 = get_ccount(); \
-            TinySparse::sparse_fc_relu(l1_out, PREFIX##_fc2_val, PREFIX##_fc2_idx, PREFIX##_fc2_off, PREFIX##_fc2_b, l2_out, FC2_OUT, PREFIX##_S2); \
+            TinySparse::sparse_fc_relu(l1_out, P_LOW##_fc2_val, P_LOW##_fc2_idx, P_LOW##_fc2_off, P_LOW##_fc2_b, l2_out, FC2_OUT, P_UP##_S2); \
             uint32_t t2 = get_ccount(); \
-            TinySparse::dense_fc_logits(l2_out, PREFIX##_fc3_dense, PREFIX##_fc3_b, logits, FC2_OUT, FC3_OUT); \
+            TinySparse::dense_fc_logits(l2_out, P_LOW##_fc3_dense, P_LOW##_fc3_b, logits, FC2_OUT, FC3_OUT); \
             pred = TinySparse::argmax(logits, FC3_OUT); \
             uint32_t t3 = get_ccount(); \
             sum_l1  += (t1 - t0); \
@@ -55,8 +55,8 @@ struct SweepResult {
         RESULT_STRUCT.l2_cycles    = sum_l2 / NUM_RUNS; \
         RESULT_STRUCT.l3_cycles    = sum_l3 / NUM_RUNS; \
         RESULT_STRUCT.total_cycles = sum_tot / NUM_RUNS; \
-        RESULT_STRUCT.flash_bytes  = PREFIX##_FLASH_BYTES; \
-        RESULT_STRUCT.int8_acc     = PREFIX##_INT8_ACC; \
+        RESULT_STRUCT.flash_bytes  = P_UP##_FLASH_BYTES; \
+        RESULT_STRUCT.int8_acc     = P_UP##_INT8_ACC; \
         RESULT_STRUCT.pred_class   = pred; \
     } while (0)
 
@@ -74,7 +74,7 @@ void setup() {
     Serial.println("  TinySparse Phase 3: Empirical Multi-Sparsity Crossover Sweep (ESP32-S3 @ 240 MHz)");
     Serial.println("==========================================================================================");
 
-    // 1. Profile 0% Dense Baseline (Using True Dense Kernels for L1, L2, L3)
+    // 1. Profile 0% Dense Baseline
     SweepResult res_dense;
     {
         uint32_t sum_l1 = 0, sum_l2 = 0, sum_l3 = 0, sum_tot = 0;
@@ -96,13 +96,13 @@ void setup() {
         res_dense = {0, sum_l1 / NUM_RUNS, sum_l2 / NUM_RUNS, sum_l3 / NUM_RUNS, sum_tot / NUM_RUNS, SP0_FLASH_BYTES, SP0_INT8_ACC, pred};
     }
 
-    // 2. Profile Sparse COO Models (0% COO overhead check, 50%, 70%, 80%, 90%)
+    // 2. Profile Sparse Models (0% COO overhead check, 50%, 70%, 80%, 90%)
     SweepResult res_sp0_coo, res_sp50, res_sp70, res_sp80, res_sp90;
-    PROFILE_SPARSE_MODEL(sp0,   0, res_sp0_coo);
-    PROFILE_SPARSE_MODEL(sp50, 50, res_sp50);
-    PROFILE_SPARSE_MODEL(sp70, 70, res_sp70);
-    PROFILE_SPARSE_MODEL(sp80, 80, res_sp80);
-    PROFILE_SPARSE_MODEL(sp90, 90, res_sp90);
+    PROFILE_SPARSE_MODEL(sp0,  SP0,   0, res_sp0_coo);
+    PROFILE_SPARSE_MODEL(sp50, SP50, 50, res_sp50);
+    PROFILE_SPARSE_MODEL(sp70, SP70, 70, res_sp70);
+    PROFILE_SPARSE_MODEL(sp80, SP80, 80, res_sp80);
+    PROFILE_SPARSE_MODEL(sp90, SP90, 90, res_sp90);
 
     SweepResult all_results[6] = {res_dense, res_sp0_coo, res_sp50, res_sp70, res_sp80, res_sp90};
     const char* labels[6] = {

@@ -1,17 +1,21 @@
 #include <Arduino.h>
 #include "TinySparse.h"
 #include "RingBuffer1D.h"
-#include "model_weights.h"
+#include "sweep_weights.h"
 
 #define WINDOW_SIZE   128
-#define STRIDE_STEP    64   // Hop stride: trigger inference every 64 new samples (50% overlap)
+#define STRIDE_STEP    64
+
+#define FC1_OUT        32
+#define FC2_OUT        16
+#define FC3_OUT         4
 
 // Static zero-allocation memory buffers (192B working inference memory)
 static RingBuffer1D<WINDOW_SIZE> ringBuffer;
 static int8_t  inputWindow[WINDOW_SIZE];
-static int8_t  l1_act[FC1_OUT_DIM];
-static int8_t  l2_act[FC2_OUT_DIM];
-static int32_t logits[FC3_OUT_DIM];
+static int8_t  l1_act[FC1_OUT];
+static int8_t  l2_act[FC2_OUT];
+static int32_t logits[FC3_OUT];
 
 const char* CLASS_NAMES[4] = {
     "Normal Condition",
@@ -26,24 +30,6 @@ static inline uint32_t get_ccount() {
     return ccount;
 }
 
-// Simulates continuous sensor acquisition stream transitioning from Healthy to Damaged
-int8_t read_simulated_sensor(uint32_t sample_idx) {
-    float t = (float)sample_idx * 0.05f;
-    float wave = 0.0f;
-
-    if (sample_idx < 400) {
-        // Stage 1: Healthy bearing vibration baseline
-        wave = 15.0f * sin(t) + ((rand() % 10) - 5);
-    } else {
-        // Stage 2: Bearing impact shock ring
-        wave = 65.0f * sin(t * 3.7f) + 30.0f * sin(t * 8.1f) + ((rand() % 20) - 10);
-    }
-
-    if (wave > 127.0f)  wave = 127.0f;
-    if (wave < -128.0f) wave = -128.0f;
-    return (int8_t)wave;
-}
-
 void setup() {
     Serial.begin(115200);
     uint32_t startWait = millis();
@@ -54,7 +40,8 @@ void setup() {
     Serial.println("  TinySparse Continuous Streaming Edge Pipeline   ");
     Serial.println("==================================================");
     Serial.printf("Window Size   : %d samples\n", WINDOW_SIZE);
-    Serial.printf("Inference Hop : %d samples (50.0%% overlap)\n", STRIDE_STEP);
+    Serial.printf("Inference Hop : %d samples (%.1f%% overlap)\n", 
+                  STRIDE_STEP, (1.0f - ((float)STRIDE_STEP / WINDOW_SIZE)) * 100.0f);
     Serial.println("Target Core   : ESP32-S3 (Xtensa LX7 @ 240 MHz)\n");
 }
 
@@ -64,7 +51,10 @@ void loop() {
 
     // Ingest stream in batches
     for (int b = 0; b < 16; ++b) {
-        int8_t sample = read_simulated_sensor(global_sample_counter++);
+        // Stream real CWRU INT8 data looping over the 128-sample array
+        // (This replaces the old 20-line simulated sin() wave generator)
+        int8_t sample = sweep_test_input[global_sample_counter % WINDOW_SIZE];
+        global_sample_counter++;
         ringBuffer.push(sample);
 
         if (ringBuffer.is_ready(STRIDE_STEP)) {
@@ -76,21 +66,21 @@ void loop() {
             uint32_t t_unwrap_end = get_ccount();
             uint32_t unwrap_cycles = t_unwrap_end - t_unwrap_start;
 
-            // 2. Execute TinySparse forward pass
+            // 2. Execute TinySparse forward pass using the 70% Sparse model
             uint32_t t_infer_start = get_ccount();
             TinySparse::sparse_fc_relu(
-                inputWindow, fc1_values, fc1_col_indices, fc1_row_offsets,
-                fc1_bias, l1_act, FC1_OUT_DIM, FC1_SHIFT
+                inputWindow, sp70_fc1_val, sp70_fc1_idx, sp70_fc1_off,
+                sp70_fc1_b, l1_act, FC1_OUT, SP70_S1
             );
             TinySparse::sparse_fc_relu(
-                l1_act, fc2_values, fc2_col_indices, fc2_row_offsets,
-                fc2_bias, l2_act, FC2_OUT_DIM, FC2_SHIFT
+                l1_act, sp70_fc2_val, sp70_fc2_idx, sp70_fc2_off,
+                sp70_fc2_b, l2_act, FC2_OUT, SP70_S2
             );
             TinySparse::dense_fc_logits(
-                l2_act, fc3_weights_dense, fc3_bias,
-                logits, FC3_IN_DIM, FC3_OUT_DIM
+                l2_act, sp70_fc3_dense, sp70_fc3_b,
+                logits, FC2_OUT, FC3_OUT
             );
-            uint8_t predicted_class = TinySparse::argmax(logits, FC3_OUT_DIM);
+            uint8_t predicted_class = TinySparse::argmax(logits, FC3_OUT);
             uint32_t t_infer_end = get_ccount();
             uint32_t infer_cycles = t_infer_end - t_infer_start;
 
