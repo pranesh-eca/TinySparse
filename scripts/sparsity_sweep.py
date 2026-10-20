@@ -81,7 +81,7 @@ def format_c_array(arr, c_type, name, per_line=16):
 
 def main():
     print("=" * 80)
-    print(" Phase 3: Automated Multi-Sparsity Sweep (0%, 50%, 70%, 80%, 90%)")
+    print(" Phase 3: Automated Multi-Sparsity Sweep on Strict 60/15/15 Split")
     print("=" * 80)
 
     data = np.load(os.path.join("models", "cwru_temporal_dataset.npz"))
@@ -175,7 +175,9 @@ def main():
 
         # Evaluate INT8 on untouched X_test
         int8_logits = bit_exact_int8_forward(X_test, w1_q, b1_q, s1, w2_q, b2_q, s2, w3_q, b3_q)
-        int8_acc = 100.0 * np.mean(np.argmax(int8_logits, axis=1) == y_test)
+        int8_preds  = np.argmax(int8_logits, axis=1)
+        int8_acc    = 100.0 * np.mean(int8_preds == y_test)
+        sample0_pred = int(int8_preds[0])
 
         fc1_val, fc1_idx, fc1_off = dense_to_coo(w1_q)
         fc2_val, fc2_idx, fc2_off = dense_to_coo(w2_q)
@@ -186,12 +188,9 @@ def main():
         l3_macs = int(w3_q.size)
         total_macs = l1_macs + l2_macs + l3_macs
 
-        # Flash Footprint Accounting (Bytes)
         if sp == 0.0:
-            # Dense storage: weights (1B) + biases (4B)
             flash_bytes = (w1_q.size + len(b1_q)*4) + (w2_q.size + len(b2_q)*4) + (w3_q.size + len(b3_q)*4)
         else:
-            # COO storage for L1 & L2 + Dense L3
             l1_coo_b = l1_macs * 2 + len(fc1_off) * 2 + len(b1_q) * 4
             l2_coo_b = l2_macs * 2 + len(fc2_off) * 2 + len(b2_q) * 4
             l3_b     = w3_q.size + len(b3_q) * 4
@@ -205,6 +204,7 @@ def main():
         header_blocks.append(f"#define {prefix.upper()}_S2 {s2}")
         header_blocks.append(f"#define {prefix.upper()}_FLASH_BYTES {flash_bytes}")
         header_blocks.append(f"#define {prefix.upper()}_INT8_ACC {int8_acc:.2f}f")
+        header_blocks.append(f"#define {prefix.upper()}_EXPECTED_CLASS {sample0_pred}")
         if sp == 0.0:
             header_blocks.append(format_c_array(w1_q.ravel(), "int8_t", f"{prefix}_fc1_dense"))
             header_blocks.append(format_c_array(w2_q.ravel(), "int8_t", f"{prefix}_fc2_dense"))
@@ -220,7 +220,17 @@ def main():
         header_blocks.append(format_c_array(b3_q,    "int32_t",  f"{prefix}_fc3_b"))
         header_blocks.append("")
 
+        if sp == 0.70:
+            # Export a 10-window stream across all 4 classes from X_test for streaming verification
+            indices = [0, 5, 1200, 1205, 2100, 2105, 3000, 3005]
+            stream_windows = X_test[indices].ravel()
+            stream_expected = int8_preds[indices]
+
+    header_blocks.append(f"#define GOLDEN_EXPECTED_CLASS { int(y_test[0]) }")
     header_blocks.append(format_c_array(X_test[0], "int8_t", "sweep_test_input"))
+    header_blocks.append(f"#define STREAM_NUM_WINDOWS {len(indices)}")
+    header_blocks.append(format_c_array(stream_windows, "int8_t", "sweep_stream_input"))
+    header_blocks.append(format_c_array(stream_expected, "uint8_t", "sweep_stream_expected"))
     header_blocks.append("#endif // SWEEP_WEIGHTS_H\n")
 
     out_header = os.path.join("include", "sweep_weights.h")
@@ -233,7 +243,7 @@ def main():
     for r in results_table:
         print(f"{r[0]:>7}%   | {r[1]:>8} | {r[2]:>8} | {r[3]:>10} | {r[4]:>9} B | {r[5]:>8.2f}% | {r[6]:>8.2f}%")
     print("-" * 80)
-    print(f"Exported all 5 quantized models to: {out_header}")
+    print(f"Exported all 5 quantized models + streaming test vectors to: {out_header}")
     print("=" * 80)
 
 if __name__ == "__main__":

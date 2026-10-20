@@ -4,7 +4,7 @@
 #include "sweep_weights.h"
 
 #define WINDOW_SIZE   128
-#define STRIDE_STEP    64
+#define STRIDE_STEP   128   // Step 1 full window to verify exact multi-class CWRU stream
 
 #define FC1_OUT        32
 #define FC2_OUT        16
@@ -42,22 +42,25 @@ void setup() {
     Serial.printf("Window Size   : %d samples\n", WINDOW_SIZE);
     Serial.printf("Inference Hop : %d samples (%.1f%% overlap)\n", 
                   STRIDE_STEP, (1.0f - ((float)STRIDE_STEP / WINDOW_SIZE)) * 100.0f);
+    Serial.printf("Stream Source : %d Real Held-Out CWRU Test Windows\n", STREAM_NUM_WINDOWS);
     Serial.println("Target Core   : ESP32-S3 (Xtensa LX7 @ 240 MHz)\n");
 }
 
 void loop() {
     static uint32_t global_sample_counter = 0;
     static uint32_t inference_event_counter = 0;
+    const uint32_t total_stream_samples = STREAM_NUM_WINDOWS * WINDOW_SIZE;
 
-    // Ingest stream in batches
+    // Ingest real CWRU test stream sample-by-sample in batches of 16
     for (int b = 0; b < 16; ++b) {
-        // Stream real CWRU INT8 data looping over the 128-sample array
-        // (This replaces the old 20-line simulated sin() wave generator)
-        int8_t sample = sweep_test_input[global_sample_counter % WINDOW_SIZE];
+        uint32_t stream_idx = global_sample_counter % total_stream_samples;
+        int8_t sample = sweep_stream_input[stream_idx];
         global_sample_counter++;
         ringBuffer.push(sample);
 
         if (ringBuffer.is_ready(STRIDE_STEP)) {
+            uint32_t window_idx = inference_event_counter % STREAM_NUM_WINDOWS;
+            uint8_t expected_class = sweep_stream_expected[window_idx];
             inference_event_counter++;
 
             // 1. Unwrap circular ring buffer
@@ -84,10 +87,14 @@ void loop() {
             uint32_t t_infer_end = get_ccount();
             uint32_t infer_cycles = t_infer_end - t_infer_start;
 
-            Serial.printf("[Event #%03u | Sample %05u] Class: %u [%-17s] | Infer: %5u cyc (%.2f us) | Unwrap: %2u cyc\n",
+            const char* status = (predicted_class == expected_class) ? "MATCH" : "MISMATCH";
+
+            Serial.printf("[Event #%03u | Sample %05u] Pred: %u (Exp: %u) [%s] [%-16s] | Infer: %5u cyc (%.2f us) | Unwrap: %2u cyc\n",
                           inference_event_counter,
                           global_sample_counter,
                           predicted_class,
+                          expected_class,
+                          status,
                           CLASS_NAMES[predicted_class],
                           infer_cycles,
                           (float)infer_cycles / 240.0f,
@@ -95,5 +102,5 @@ void loop() {
         }
     }
 
-    delay(5);
+    delay(10);
 }
