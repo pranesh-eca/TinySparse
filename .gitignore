@@ -6,3 +6,4 @@ normal/
 *.obj
 build/
 __pycache__/
+build/ 
