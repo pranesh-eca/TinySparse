@@ -75,21 +75,26 @@ The model is evaluated across two distinct, non-overlapping experimental protoco
   * **Healthy Specificity:** 99.34%
 
 ---
+## Quick Start & Usage
 
-## Repository Structure
+`TinySparse` is a header-only library. Simply drop `TinySparse.h` into your project.
 
-```text
-├── include/
-│   ├── TinySparse.h              # Header-only bare-metal C++ inference core
-│   └── RingBuffer1D.h            # O(1) circular ring buffer for continuous streams
-├── scripts/
-│   ├── prepare_cwru_dataset.py   # Path A cross-severity dataset generator
-│   ├── train_baseline.py         # Path A training and evaluation pipeline
-│   ├── prepare_cwru_dataset_temporal.py  # Path B chronological holdout generator
-│   ├── train_temporal_baseline.py        # Path B training and evaluation pipeline
-│   ├── prune_and_quantize.py     # L1 unstructured pruning and INT8 export
-│   └── tinysparse_compiler.py    # Auto-generation of model_weights.h
-├── models/                       # Processed datasets and PyTorch weight checkpoints
-└── examples/
-    ├── esp32s3_benchmark/        # Hardware cycle benchmark sketch for ESP32-S3
-    └── esp32s3_streaming/        # Continuous ring-buffer streaming ingestion sketch
+### Arduino / ESP32
+Since the repository includes a `library.properties` file, you can zip the folder and add it via **Sketch > Include Library > Add .ZIP Library** in the Arduino IDE, or include it directly:
+```cpp
+#include "TinySparse.h"
+
+// 192 Bytes working memory
+int8_t input_window[128];
+int8_t hidden_act[32];
+
+void setup() {
+    // Execute INT8 Sparse COO Layer
+    TinySparse::sparse_fc_relu(
+        input_window, 
+        weight_values, weight_col_indices, weight_row_offsets, biases, 
+        hidden_act, 
+        32,      // Output features
+        10       // Quantization right-shift
+    );
+}
