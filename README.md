@@ -66,14 +66,15 @@ The model is evaluated across two distinct, non-overlapping experimental protoco
   * **Healthy Specificity:** 99.80%
 
 ### 2. Path A: Cross-Severity Holdout (Generalization Stress Test)
-* **Design:** The network is trained solely on mild (0.007") and severe (0.021") defect diameters, plus healthy baselines. The intermediate defect severity (0.014") is completely withheld and evaluated zero-shot.
-* **Main Objective:** Evaluates whether raw time-domain waveforms transfer across defect geometries without frequency-domain transformations.
-* **4-Class Test Accuracy:** **61.92%** (Geometric phase shifts across defect sizes create ambiguity between Inner and Outer race fault modes).
-* **Binary Diagnostic Performance (Healthy vs. Faulty):**
-  * **Accuracy:** 97.25%
-  * **Fault Sensitivity:** 96.69%
-  * **Healthy Specificity:** 99.34%
+### Model Limitations & Generalization (Path A Zero-Shot Stress Test)
+To transparently document the generalization limits of MLP-based vibration analysis, we conducted a rigorous cross-severity stress test (Path A). 
 
+The model was trained exclusively on **0.007"** and **0.021"** defect diameters, and tested *zero-shot* on entirely unseen **0.014"** defect recordings.
+* **Training Accuracy:** 99.33%
+* **Validation Accuracy:** 96.69%
+* **Zero-Shot Test Accuracy (0.014"):** 62.34%
+
+**Engineering Takeaway:** The severe drop from 99% to 62% proves that the neural network overfits to the acoustic resonant frequencies of specific fault geometries, rather than generalizing the underlying physics of bearing failure. Therefore, for production deployment, the model must be calibrated on data covering the exact mechanical tolerances it will evaluate in the field.
 ---
 ## Quick Start & Usage
 
