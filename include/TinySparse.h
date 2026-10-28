@@ -1,11 +1,11 @@
 /**
  * @file TinySparse.h
- * @brief Bare-Metal Coordinate (COO) Sparse & Dense INT8 Inference Engine
+ * @brief Bare-Metal CSR Sparse & Dense INT8 Inference Engine
  * 
  * Designed for resource-constrained microcontrollers (ESP32-S3, ARM Cortex-M, RISC-V).
  * Features:
  *  - Zero dynamic memory allocation (no malloc/new).
- *  - Unstructured Coordinate (COO) sparse execution for hidden layers.
+ *  - Unstructured compressed sparse row (CSR) execution for hidden layers.
  *  - Symmetric INT8 weights and activations with 32-bit accumulators.
  *  - Configurable per-layer fixed-point bit-shift requantization.
  *  - Dense INT8 baseline kernels for direct hardware cycle profiling.
@@ -20,7 +20,7 @@
 namespace TinySparse {
 
 /**
- * @brief Executes a Sparse Fully-Connected Layer (COO format) with ReLU and Fixed-Point Shift.
+ * @brief Executes a Sparse Fully-Connected Layer (CSR format) with ReLU and Fixed-Point Shift.
  * 
  * Mathematical Contract:
  *   acc[row] = bias[row] + sum(values[idx] * input[col_indices[idx]])
@@ -141,13 +141,32 @@ inline void dense_fc_logits(
     }
 }
 
+/** Sparse final layer with the same INT32 logit contract as dense_fc_logits. */
+inline void sparse_fc_logits(
+    const int8_t* __restrict input,
+    const int8_t* __restrict values,
+    const uint8_t* __restrict col_indices,
+    const uint16_t* __restrict row_offsets,
+    const int32_t* __restrict bias,
+    int32_t* __restrict output_logits,
+    uint16_t out_features
+) {
+    for (uint16_t row = 0; row < out_features; ++row) {
+        int32_t acc = bias[row];
+        for (uint16_t idx = row_offsets[row]; idx < row_offsets[row + 1]; ++idx) {
+            acc += static_cast<int32_t>(values[idx]) * static_cast<int32_t>(input[col_indices[idx]]);
+        }
+        output_logits[row] = acc;
+    }
+}
+
 /**
  * @brief Returns the class index with the highest INT32 logit score.
  */
-inline uint8_t argmax(const int32_t* logits, uint16_t num_classes) {
-    uint8_t best_idx = 0;
+inline uint16_t argmax(const int32_t* logits, uint16_t num_classes) {
+    uint16_t best_idx = 0;
     int32_t max_val  = logits[0];
-    for (uint8_t i = 1; i < num_classes; ++i) {
+    for (uint16_t i = 1; i < num_classes; ++i) {
         if (logits[i] > max_val) {
             max_val  = logits[i];
             best_idx = i;

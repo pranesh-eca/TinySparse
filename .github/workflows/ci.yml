@@ -14,15 +14,17 @@ jobs:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Set up GCC compiler
-      run: sudo apt-get update && sudo apt-get install -y g++
+    - name: Configure
+      run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
 
-    - name: Run RingBuffer1D Unit Tests
-      run: |
-        g++ -O3 -Wall -Wextra -Iinclude tests/test_ring_buffer.cpp -o test_ring_buffer
-        ./test_ring_buffer
+    - name: Build
+      run: cmake --build build --parallel
 
-    - name: Run Host C++ Bit-Exact Verification Suite
-      run: |
-        g++ -O3 -Wall -Wextra -Iinclude examples/pc_verify/verify_inference.cpp -o verify_inference
-        ./verify_inference
+    - name: Run all host tests
+      run: ctest --test-dir build --output-on-failure
+
+    - name: Install exporter dependency
+      run: python -m pip install 'numpy>=1.23,<2'
+
+    - name: Verify model exporter
+      run: python -m unittest discover -s tests -p test_exporter.py

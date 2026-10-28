@@ -1,101 +1,93 @@
-# TinySparse: Bare-Metal Sparse Inference Engine for Microcontrollers
+# TinySparse
 
-TinySparse is an ultra-lightweight, header-only C++ inference engine optimized for 1D time-series vibration analysis on edge microcontrollers. It executes unstructured Coordinate (COO) sparse matrix math and symmetric INT8 fixed-point arithmetic without dynamic heap allocation (`malloc`/`new`), external math runtimes, or desktop dependencies.
+TinySparse is a small, header-only C++17 library for INT8 fully connected inference on microcontrollers. Its current example classifies 128-sample vibration windows with a 128 -> 32 -> 16 -> 4 network. Hidden layers use row-offset sparse storage; the output layer is dense. The inference kernels allocate no heap memory. Training, pruning, calibration, and model export happen offline in Python.
 
----
+The project has been tested on an ESP32-S3 and built with host GCC. The C++ kernels are intended to be portable, but other MCU families have not been validated. ESP32-S3 has a single-precision FPU; TinySparse's inference path uses integer arithmetic and does not require that FPU or a dedicated neural accelerator.
 
-## Key Architectural Specifications
+## Current scope
 
-* **Target Silicon:** ESP32-S3 (Xtensa Dual-Core 32-bit LX7 @ 240 MHz).
-* **Model Topology:** 3-Layer Multilayer Perceptron (`128 -> 32 -> 16 -> 4`).
-* **Sparsity Representation:** Coordinate (COO) sparse matrix storage (`values`, `indices`, `row_offsets`).
-* **Numerical Representation:** Symmetric INT8 quantization with arithmetic right-shift (`>> 7`) scaling and INT32 accumulators.
-* **Continuous Ingestion:** Circular 1D Ring Buffer (`RingBuffer1D.h`) with $O(1)$ sample insertion and dual-`memcpy` window unwrapping.
+- The original CWRU header has fixed dimensions and quantization shifts. The new model descriptor supports varying fully connected layer widths and per-layer dense/CSR storage; it does not yet support convolutional or recurrent layers.
+- The row-offset format is compressed sparse row (CSR): INT8 values, 8-bit input-column indices, 16-bit row offsets, and INT32 biases.
+- Skipping zero weights reduces inference work. TinySparse does not compress or discard raw sensor samples.
+- The Arduino streaming example replays eight stored held-out windows through the ring buffer. It does not acquire a live sensor stream. Its inference hop is 128 samples; the dataset windows use stride 64.
 
----
+## Build and verify on a host
 
-## Memory Footprint Accounting
+~~~sh
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+~~~
 
-To maintain strict embedded resource transparency, memory is reported across distinct hardware boundaries:
+The four C++ tests cover ring-buffer behavior, a generated Python reference vector at every network layer, kernel edge cases, and the reusable model interface. A separate Python test exports a mixed dense/CSR model, compiles it, and checks its logits. The golden-vector tests check selected inputs. They do not establish correctness for every possible input. CI runs all five tests.
 
-| Memory Domain | Size | Description |
-| :--- | :--- | :--- |
-| **Input Feature Buffer** | 128 Bytes | Contiguous INT8 array holding one normalized vibration window |
-| **Intermediate Activation Scratchpad** | 64 Bytes | Static buffers: Layer 1 (32B), Layer 2 (16B), Output Logits (16B) |
-| **Total Working SRAM (Inference)** | **192 Bytes** | Peak static working memory during forward pass |
-| **Dynamic Heap Allocation** | **0 Bytes** | Zero `malloc`, zero heap fragmentation risk |
-| **Flash Parameter Storage (COO L1)** | 2,458 Bytes | 1,229 non-zero weights (INT8) + 1,229 column indices (uint8_t) |
-| **Flash Parameter Storage (Dense L1 Base)** | 4,096 Bytes | 4,096 dense weights (INT8) |
+To reproduce the model experiments, install the packages in `requirements.txt` and use the scripts in `scripts/`. The CWRU .mat files are not bundled. If you change a checkpoint locally, regenerate its header and verify the reference outputs before using it as a released model. Dataset and training provenance remain planned improvements.
 
----
-## Empirical Hardware Profiling & Sparsity Crossover Sweep
+## Memory accounting
 
-Measurements captured on physical silicon (**ESP32-S3, Xtensa Dual-Core 32-bit LX7 @ 240 MHz**) using internal hardware cycle counters (`rsr %0, ccount`) over native USB CDC, averaged across 1,000 inference runs, paired with bit-exact INT8 accuracy on the strict 60/15/15 chronological holdout split:
+The CWRU inference example uses 128 bytes for a contiguous input window, 32 and 16 bytes for hidden activations, and 16 bytes for four INT32 logits: **192 bytes of explicit inference arrays**. This excludes the streaming ring buffer, stack, framework, serial telemetry, and other application state. No `malloc` or `new` appears in the inference kernels; the 192-byte figure is not whole-application peak RAM.
 
-| Model Configuration | L1 Non-Zero MACs | L2 Non-Zero MACs | Total MACs | End-to-End Cycles | Latency (@ 240 MHz) | System Speedup | Total Model Flash | FP32 Test Acc | Verified INT8 Acc |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **0% (Dense Kernel)** | 4,054 | 503 | 4,621 | 85,722 cyc | 357.17 µs | 1.00x (Base) | 4,880 Bytes | 91.36% | 91.00% |
-| **0% (COO Kernel)** | 4,054 | 503 | 4,621 | 89,628 cyc | 373.45 µs | 0.96x (-4.5%) | 4,880 Bytes | 91.36% | 91.00% |
-| **50% (COO Sparse)** | 2,048 | 256 | 2,368 | 46,375 cyc | 193.23 µs | 1.85x | 4,980 Bytes | 90.46% | 90.62% |
-| **70% (COO Sparse)** | **1,226** | **154** | **1,444** | **28,748 cyc** | **119.78 µs** | **2.98x** | **3,132 Bytes** | **88.92%** | **88.75%** |
-| **80% (COO Sparse)** | 817 | 102 | 983 | 19,906 cyc | 82.94 µs | 4.31x | 2,210 Bytes | 84.01% | 84.09% |
-| **90% (COO Sparse)** | 406 | 51 | 521 | 11,096 cyc | 46.23 µs | 7.73x | 1,286 Bytes | 70.14% | 69.92% |
+Parameter bytes below count compiled weight, index, row-offset, and bias arrays. They are not the size of the whole firmware image. The 0% CSR array count is 9,486 bytes, while the dense representation is 4,880 bytes. The 50% CSR model is also larger than dense. The point at which sparse storage becomes smaller depends on actual nonzero counts and layer dimensions.
 
-### Engineering Takeaways
-1. **The Indirection Tax:** At 0% pruning, COO execution is ~4.5% slower than dense due to column index loads and row offset indirection[cite: 1].
-2. **Flash Memory Threshold:** Because COO requires 2 bytes per weight plus row offset tables, storage savings only begin above ~52% sparsity[cite: 1]. At 50%, COO is 100 bytes larger than dense.
-3. **The Pareto Optimal Point:** 70% sparsity achieves a **2.98x full-pipeline speedup** and **35.7% Flash reduction** while preserving 88.73% 4-class test accuracy on temporal holdout data.
-### Silicon Efficiency Takeaways
-* **Layer 1 Speedup:** **1.99x faster (49.9% cycle reduction)** and **40.0% Flash memory savings** on Layer 1 parameters.
-* **Sparsity Indirection Overhead:** Dense sequential streaming averages ~7.6 cycles/MAC on Xtensa LX7, whereas sparse indirect indexing averages ~12.7 cycles/MAC. A minimum of 60–70% sparsity is required to overcome the pointer-lookup overhead on this core.
-* **Real-Time Duty Cycle:** Slicing a 128-sample window at 12 kHz with a 64-sample hop stride gives an inference deadline every 5.33 ms. An 89.77 µs inference consumes **<1.7% of a single CPU core**, reserving >98% of processor bandwidth for concurrent RTOS tasks or peripheral I/O.
+The Arduino compiler's program-storage and global-RAM totals, plus stack usage, have not yet been recorded here.
 
----
+## Reported ESP32-S3 benchmark
 
-## Leakage-Free Diagnostic Validation
+These are the previously recorded figures from the ESP32-S3 crossover sweep at 240 MHz, averaged over 1,000 runs. The cycle measurement covers the three inference layers and argmax; it excludes sensor acquisition, preprocessing, ring-buffer copying, and serial output. INT8 accuracy was calculated offline on the within-recording temporal test set. No new hardware measurements were made for this README revision.
 
-The model is evaluated across two distinct, non-overlapping experimental protocols using the Case Western Reserve University (CWRU) 12 kHz Drive-End bearing vibration dataset:
+| Model | MACs | Cycles | Inference latency | Speedup vs dense | Parameter arrays | INT8 4-class accuracy |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0% dense | 4,621 | 85,722 | 357.17 us | 1.00x | 4,880 B | 91.00% |
+| 0% CSR | 4,621 | 89,628 | 373.45 us | 0.96x | 9,486 B | 91.00% |
+| 50% CSR | 2,368 | 46,375 | 193.23 us | 1.85x | 4,980 B | 90.62% |
+| 70% CSR | 1,444 | 28,748 | 119.78 us | 2.98x | 3,132 B | 88.75% |
+| 80% CSR | 983 | 19,906 | 82.94 us | 4.31x | 2,210 B | 84.09% |
+| 90% CSR | 521 | 11,096 | 46.23 us | 7.73x | 1,286 B | 69.92% |
 
-### 1. Path B: Within-Recording Temporal Holdout (Primary Streaming Benchmark)
-* **Design:** Continuous time-series recordings are chronologically partitioned *prior* to window slicing. The first 70% of time is used for training, an unwindowed guard interval (>12,000 raw samples / >1 second) is completely discarded, and the final 20% is held out for testing.
-* **Main Objective:** Evaluates whether TinySparse can reliably process future, non-overlapping windows from characterized machinery under stationary operating conditions.
-* **4-Class Test Accuracy:** **91.56%** (4,926 held-out test windows).
-* **Binary Diagnostic Performance (Healthy vs. Faulty):**
-  * **Accuracy:** 99.80%
-  * **Fault Sensitivity:** 99.80%
-  * **Healthy Specificity:** 99.80%
+The 70% point trades 2.25 percentage points of INT8 accuracy against the 0% dense model for lower latency and parameter storage. The right choice depends on an application's accuracy, storage, and timing requirements. The 0% CSR case shows that sparse indexing has a cost when few weights are zero.
 
-### 2. Path A: Cross-Severity Holdout (Generalization Stress Test)
-### Model Limitations & Generalization (Path A Zero-Shot Stress Test)
-To transparently document the generalization limits of MLP-based vibration analysis, we conducted a rigorous cross-severity stress test (Path A). 
+The crossover sketch now checks each model's predicted class against the class exported by Python for its test input. This is a class check, not a hardware bit-exact check of intermediate activations and logits. It must be rerun on hardware after code changes.
 
-The model was trained exclusively on **0.007"** and **0.021"** defect diameters, and tested *zero-shot* on entirely unseen **0.014"** defect recordings.
-* **Training Accuracy:** 99.33%
-* **Validation Accuracy:** 96.69%
-* **Zero-Shot Test Accuracy (0.014"):** 62.34%
+## Dataset evaluation
 
-**Engineering Takeaway:** The severe drop from 99% to 62% proves that the neural network overfits to the acoustic resonant frequencies of specific fault geometries, rather than generalizing the underlying physics of bearing failure. Therefore, for production deployment, the model must be calibrated on data covering the exact mechanical tolerances it will evaluate in the field.
----
-## Quick Start & Usage
+The CWRU demonstration is an application benchmark for the library. These results describe this model and these data splits; they are not general accuracy guarantees for the engine.
 
-`TinySparse` is a header-only library. Simply drop `TinySparse.h` into your project.
+**Path B: within-recording temporal holdout.** Each raw recording is split chronologically into 60% training, 5% discarded guard, 15% validation, 5% discarded guard, and 15% test before windowing (128 samples, stride 64). This produced 14,808 training, 3,690 validation, and 3,690 test windows. The recorded dense FP32 4-class test accuracy was 91.36%. The sparse 70% INT8 model from the sweep achieved 88.75% on the same protocol. The guard bands prevent windows from crossing partitions, but segments of the same recording can remain statistically correlated; this experiment does not test unseen bearings.
 
-### Arduino / ESP32
-Since the repository includes a `library.properties` file, you can zip the folder and add it via **Sketch > Include Library > Add .ZIP Library** in the Arduino IDE, or include it directly:
-```cpp
+**Path A: cross-severity stress test.** The separate model was trained on 0.007-inch and 0.021-inch faults and evaluated on held-out 0.014-inch fault recordings. Its reported 4-class test accuracy was 62.34%. This is evidence of limited transfer for this model and protocol; it does not identify the physical cause of the errors or establish a general limit for time-domain models.
+
+A bearing or specimen holdout, if the source metadata permits it, remains future work for stronger claims about transfer to new machinery.
+
+## Using the kernels
+
+Arduino IDE can install the repository as a ZIP library using `library.properties`. The examples copy headers locally so each sketch opens as a standalone Arduino project. For a new model, offline quantization and header export are currently required.
+
+~~~cpp
 #include "TinySparse.h"
 
-// 192 Bytes working memory
-int8_t input_window[128];
-int8_t hidden_act[32];
+// For one sparse hidden layer, the caller owns input and output buffers.
+TinySparse::sparse_fc_relu(
+    input, values, column_indices, row_offsets, biases,
+    output, output_neurons, calibrated_shift
+);
+~~~
 
-void setup() {
-    // Execute INT8 Sparse COO Layer
-    TinySparse::sparse_fc_relu(
-        input_window, 
-        weight_values, weight_col_indices, weight_row_offsets, biases, 
-        hidden_act, 
-        32,      // Output features
-        10       // Quantization right-shift
-    );
-}
+For an already-quantized model in the `fc1_w`, `fc1_b`, `fc1_shift`, `fc2_w`, ... `.npz` format, export a model descriptor and arrays with:
+
+~~~sh
+python scripts/export_adaptive_model.py --input models/pruned_quantized_model.npz --output include/my_model.h
+~~~
+
+The exporter selects the smaller dense or CSR representation for each layer. It does not prune, train, or quantize weights, and choosing smaller arrays does not guarantee faster execution. It validates supported dimensions, types, shifts, and a conservative INT32 overflow bound. The generated header contains a `TinySparseExport::model` descriptor and optional golden input/logits when those are present in the checkpoint. Checkpoint changes require a fresh export.
+
+For models with different dimensions, include `TinySparseModel.h` and the exported header. Call `validate_model(model)` once before inference; it checks dimensions, CSR indices and offsets, and the overflow bound. Allocate `required_workspace_bytes(model)` bytes yourself, then call `run_model(model, input, workspace, workspace_bytes, logits)`. The workspace uses two alternating INT8 buffers sized for the widest hidden layer. The final layer returns INT32 logits. Model arrays and buffers must remain alive and must not overlap. See `tests/test_model.cpp` for a complete mixed dense/CSR example. The older `tinysparse_compiler.py` remains available for the original fixed CWRU example.
+
+The exact arithmetic and input assumptions are documented in `docs/numerical-contract.md`.
+
+Use `examples/pc_verify/` as the exact arithmetic example, `examples/esp32s3_crossover_sweep/` as the hardware benchmark, and `examples/esp32s3_streaming/` as the replay demonstration. The input must use the same sample ordering and INT8 preprocessing as the exported model.
+
+## Next library milestone
+
+Tie each exported header to its checkpoint and measure the generated model on hardware. Automatic storage selection currently minimizes parameter-array bytes; hardware speed-based selection requires measurements on the target board. Broader layer support can follow after those checks.
+
+The source is provided under the terms in `LICENSE.txt`; the CWRU dataset has its own attribution and usage terms.

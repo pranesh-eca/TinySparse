@@ -36,3 +36,8 @@ add_test(NAME verify_inference COMMAND verify_inference)
 add_executable(test_kernels tests/test_kernels.cpp)
 target_link_libraries(test_kernels PRIVATE TinySparse)
 add_test(NAME test_kernels COMMAND test_kernels)
+
+# Reusable model descriptor and caller-owned workspace
+add_executable(test_model tests/test_model.cpp)
+target_link_libraries(test_model PRIVATE TinySparse)
+add_test(NAME test_model COMMAND test_model)

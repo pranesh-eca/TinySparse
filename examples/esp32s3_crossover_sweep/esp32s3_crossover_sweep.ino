@@ -58,6 +58,9 @@ struct SweepResult {
         RESULT_STRUCT.flash_bytes  = P_UP##_FLASH_BYTES; \
         RESULT_STRUCT.int8_acc     = P_UP##_INT8_ACC; \
         RESULT_STRUCT.pred_class   = pred; \
+        if (pred != P_UP##_EXPECTED_CLASS) { \
+            Serial.printf("[ERROR] %d%% sparse model: class %u, Python reference %u\n", SP_PCT, pred, P_UP##_EXPECTED_CLASS); \
+        } \
     } while (0)
 
 void setup() {
@@ -94,11 +97,18 @@ void setup() {
             sum_tot += (t3 - t0);
         }
         res_dense = {0, sum_l1 / NUM_RUNS, sum_l2 / NUM_RUNS, sum_l3 / NUM_RUNS, sum_tot / NUM_RUNS, SP0_FLASH_BYTES, SP0_INT8_ACC, pred};
+        if (pred != SP0_EXPECTED_CLASS) {
+            Serial.printf("[ERROR] Dense model: class %u, Python reference %u\n", pred, SP0_EXPECTED_CLASS);
+        }
     }
 
     // 2. Profile Sparse Models (0% COO overhead check, 50%, 70%, 80%, 90%)
     SweepResult res_sp0_coo, res_sp50, res_sp70, res_sp80, res_sp90;
     PROFILE_SPARSE_MODEL(sp0,  SP0,   0, res_sp0_coo);
+    // The generated SP0_FLASH_BYTES describes the dense representation.
+    res_sp0_coo.flash_bytes = sizeof(sp0_fc1_val) + sizeof(sp0_fc1_idx) + sizeof(sp0_fc1_off) + sizeof(sp0_fc1_b)
+                            + sizeof(sp0_fc2_val) + sizeof(sp0_fc2_idx) + sizeof(sp0_fc2_off) + sizeof(sp0_fc2_b)
+                            + sizeof(sp0_fc3_dense) + sizeof(sp0_fc3_b);
     PROFILE_SPARSE_MODEL(sp50, SP50, 50, res_sp50);
     PROFILE_SPARSE_MODEL(sp70, SP70, 70, res_sp70);
     PROFILE_SPARSE_MODEL(sp80, SP80, 80, res_sp80);
